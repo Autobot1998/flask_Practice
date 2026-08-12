@@ -16,7 +16,8 @@ jobs:
           - 27017:27017
 
     env:
-      MONGO_URI: mongodb://localhost:27017/test_student_db
+      MONGO_URI: mongodb+srv://pravincalvin7890_db_user:aC4pAn5nUugXs7bQ@cluster0.wvcstpa.mongodb.net/studentdb?retryWrites=true&w=majority
+
 
 
     steps:

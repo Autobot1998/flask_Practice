@@ -16,6 +16,15 @@ app.secret_key = os.getenv("SECRET_KEY")
 # (notably fixes common macOS certificate verification failures).
 mongo = PyMongo(app, tlsCAFile=certifi.where())
 
+# Health check
+@app.route('/health')
+def health():
+    try:
+        mongo.db.command('ping')
+        return {"status": "healthy"}, 200
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}, 500
+
 # Home page -> list students
 @app.route('/')
 def index():

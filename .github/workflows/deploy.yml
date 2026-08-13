@@ -1,28 +1,34 @@
-name: Flask CI/CD
+name: CI/CD Pipeline - Flask MongoDB App
 
 on:
   push:
     branches:
       - main
 
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: flask-practice
+  APP_PORT: 5000
+
 jobs:
+
+  # ============================================================
+  # 1. TEST
+  # ============================================================
   test:
+    name: Install & Test
     runs-on: ubuntu-latest
 
-    services:
-      mongodb:
-        image: mongo:7
-        ports:
-          - 27017:27017
-
-    env:
-      MONGO_URI: mongodb+srv://pravincalvin7890_db_user:aC4pAn5nUugXs7bQ@cluster0.wvcstpa.mongodb.net/studentdb?retryWrites=true&w=majority
-
-
+    outputs:
+      short_sha: ${{ steps.vars.outputs.short_sha }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Set short SHA
+        id: vars
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -35,4 +41,291 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run pytest
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
         run: pytest -v
+
+
+  # ============================================================
+  # 2. BUILD & PUSH DOCKER IMAGE TO ECR
+  # ============================================================
+  build-and-push:
+    name: Build & Push to ECR
+    needs: test
+    runs-on: ubuntu-latest
+
+    outputs:
+      image_tag: ${{ steps.build.outputs.image_tag }}
+      ecr_registry: ${{ steps.login-ecr.outputs.registry }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ needs.test.outputs.short_sha }}
+
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+
+  # ============================================================
+  # 3. DEPLOY TO EC2
+  # ============================================================
+  deploy:
+    name: Deploy to EC2
+    needs:
+      - test
+      - build-and-push
+
+    runs-on: ubuntu-latest
+
+    outputs:
+      deploy_status: ${{ steps.verify.outputs.status }}
+
+    steps:
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+
+          envs: MONGO_URI
+
+          script: |
+            set -e
+
+            echo "======================================"
+            echo "Starting deployment"
+            echo "======================================"
+
+            echo "Logging into ECR..."
+
+            aws ecr get-login-password \
+              --region ${{ env.AWS_REGION }} \
+              | docker login \
+              --username AWS \
+              --password-stdin \
+              ${{ needs.build-and-push.outputs.ecr_registry }}
+
+            echo "Pulling Docker image..."
+
+            docker pull \
+              ${{ needs.build-and-push.outputs.ecr_registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.build-and-push.outputs.image_tag }}
+
+            echo "Stopping old container..."
+
+            docker stop flask-practice-app || true
+
+            echo "Removing old container..."
+
+            docker rm flask-practice-app || true
+
+            echo "Starting new container..."
+
+            docker run -d \
+              --name flask-practice-app \
+              --restart unless-stopped \
+              -p ${{ env.APP_PORT }}:${{ env.APP_PORT }} \
+              -e MONGO_URI="$MONGO_URI" \
+              ${{ needs.build-and-push.outputs.ecr_registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.build-and-push.outputs.image_tag }}
+
+            echo "Waiting for application..."
+
+            sleep 8
+
+            echo "Checking container..."
+
+            docker ps
+
+            echo "Checking application health..."
+
+            curl -f http://localhost:${{ env.APP_PORT }}/health
+
+            echo "======================================"
+            echo "Deployment successful"
+            echo "======================================"
+
+
+      # ========================================================
+      # 4. VERIFY DEPLOYMENT
+      # ========================================================
+      - name: Verify health endpoint
+        id: verify
+        uses: appleboy/ssh-action@v1.0.3
+
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+
+          script: |
+            for i in 1 2 3 4 5
+            do
+              echo "Health check attempt $i"
+
+              if curl -sf http://localhost:${{ env.APP_PORT }}/health
+              then
+                echo "Application is healthy"
+                exit 0
+              fi
+
+              echo "Health check failed"
+              sleep 5
+            done
+
+            echo "Application health check failed"
+            exit 1
+
+        continue-on-error: false
+
+      - name: Set deployment status
+        id: status
+        if: success()
+        run: echo "status=success" >> "$GITHUB_OUTPUT"
+
+
+  # ============================================================
+  # 5. SUCCESS EMAIL
+  # ============================================================
+  notify-success:
+    name: Notify Success
+
+    needs:
+      - test
+      - build-and-push
+      - deploy
+
+    if: ${{ needs.test.result == 'success' && needs.build-and-push.result == 'success' && needs.deploy.result == 'success' }}
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Send success email
+        uses: dawidd6/action-send-mail@v3
+
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USER }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+
+          subject: "SUCCESS - flask_Practice deploy (${{ needs.build-and-push.outputs.image_tag }})"
+
+          to: ${{ secrets.NOTIFY_EMAIL }}
+          from: CI/CD Pipeline
+
+          body: |
+            Deployment succeeded.
+
+            Repository:
+            ${{ github.repository }}
+
+            Commit SHA:
+            ${{ github.sha }}
+
+            Branch:
+            ${{ github.ref_name }}
+
+            Docker image tag:
+            ${{ needs.build-and-push.outputs.image_tag }}
+
+            ECR repository:
+            ${{ needs.build-and-push.outputs.ecr_registry }}/flask-practice
+
+            EC2 target:
+            ${{ secrets.EC2_HOST }}
+
+            Pipeline run:
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+
+  # ============================================================
+  # 6. FAILURE EMAIL
+  # ============================================================
+  notify-failure:
+    name: Notify Failure
+
+    needs:
+      - test
+      - build-and-push
+      - deploy
+
+    if: ${{ always() && (needs.test.result == 'failure' || needs.build-and-push.result == 'failure' || needs.deploy.result == 'failure') }}
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Determine failed stage
+        id: stage
+        run: |
+          if [ "${{ needs.test.result }}" == "failure" ]; then
+            echo "failed_stage=Test" >> "$GITHUB_OUTPUT"
+
+          elif [ "${{ needs.build-and-push.result }}" == "failure" ]; then
+            echo "failed_stage=Build/Push to ECR" >> "$GITHUB_OUTPUT"
+
+          elif [ "${{ needs.deploy.result }}" == "failure" ]; then
+            echo "failed_stage=Deploy to EC2 / Health Check" >> "$GITHUB_OUTPUT"
+
+          else
+            echo "failed_stage=Unknown" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send failure email
+        uses: dawidd6/action-send-mail@v3
+
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USER }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+
+          subject: "FAILED - flask_Practice pipeline"
+
+          to: ${{ secrets.NOTIFY_EMAIL }}
+          from: CI/CD Pipeline
+
+          body: |
+            Pipeline failed.
+
+            Failed stage:
+            ${{ steps.stage.outputs.failed_stage }}
+
+            Repository:
+            ${{ github.repository }}
+
+            Commit SHA:
+            ${{ github.sha }}
+
+            Branch:
+            ${{ github.ref_name }}
+
+            Pipeline run:
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Please check GitHub Actions logs for details.
